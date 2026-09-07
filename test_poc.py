@@ -1,322 +1,403 @@
 import os
 import sys
 import time
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtGui import QWindow, QResizeEvent, QMouseEvent, QColor
+from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtGui import QResizeEvent
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
-    QLineEdit, QPushButton, QLabel, QMessageBox, QGroupBox,
-    QGraphicsDropShadowEffect, QFrame, QCheckBox
+    QApplication, QWidget, QVBoxLayout, QHBoxLayout, QSizePolicy,
+    QLineEdit, QPushButton, QLabel, QMessageBox, QGroupBox, QCheckBox
 )
 
-# X11/XWayland interface library
-from Xlib import X, display
+from Xlib import X, Xutil, display
 from Xlib.ext import xtest
 
 
-class FloatingContainer(QFrame):
+class EmbedHost(QWidget):
     """
-    A floating overlay panel that lives inside the main Qt window.
-    Hosts embedded foreign QWindow and manages internal active geometry.
+    Naked native X11 host filling the main window viewport.
+    No floating chrome — Wine is reparented directly here at (0,0).
     """
-    def __init__(self, parent=None):
+
+    def __init__(self, x_display=None, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.SubWindow)
-        self.setStyleSheet("""
-            FloatingContainer {
-                background-color: #252526;
-                border: 2px solid #007acc;
-                border-radius: 8px;
-            }
-        """)
+        self.x_display = x_display
+        self.foreign_win_id = None
+        self.aspect = None  # (w, h) locked aspect of embedded app; None = stretch fill
 
-        shadow = QGraphicsDropShadowEffect(self)
-        shadow.setBlurRadius(20)
-        shadow.setColor(QColor(0, 0, 0, 160))
-        shadow.setOffset(0, 4)
-        self.setGraphicsEffect(shadow)
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setStyleSheet("background-color: #101010;")
+        self.setMinimumSize(320, 240)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self.drag_position = QPoint()
-        self.is_dragging = False
-        self.foreign_qwindow = None
-        self.embedded_qt_container = None
+        self._geom_lock = QTimer(self)
+        self._geom_lock.setInterval(250)
+        self._geom_lock.timeout.connect(self.sync_foreign_geometry)
 
-        self.init_ui()
+    def _x(self, win_id: int):
+        return self.x_display.create_resource_object("window", win_id)
 
-    def init_ui(self):
-        self.main_layout = QVBoxLayout(self)
-        self.main_layout.setContentsMargins(6, 6, 6, 6)
-        self.main_layout.setSpacing(4)
+    def host_xid(self) -> int:
+        return int(self.winId())
 
-        # Header Bar
-        self.header = QFrame()
-        self.header.setFixedHeight(30)
-        self.header.setStyleSheet("background-color: #333333; border-radius: 4px;")
-        header_layout = QHBoxLayout(self.header)
-        header_layout.setContentsMargins(8, 0, 8, 0)
-
-        self.title_label = QLabel("Floating Wine Panel (Drag Here)")
-        self.title_label.setStyleSheet("color: #ffffff; font-weight: bold;")
-        header_layout.addWidget(self.title_label)
-
-        self.main_layout.addWidget(self.header)
-
-        # Embedded Content Area
-        self.content_area = QWidget()
-        self.content_area.setStyleSheet("background-color: #1e1e1e;")
-        self.content_layout = QVBoxLayout(self.content_area)
-        self.content_layout.setContentsMargins(0, 0, 0, 0)
-        
-        self.main_layout.addWidget(self.content_area)
-
-    def attach_foreign_window(self, win_id: int):
-        """Safely attaches foreign X11 window into container."""
+    def host_pixel_size(self) -> tuple[int, int]:
         try:
-            if self.embedded_qt_container:
-                self.content_layout.removeWidget(self.embedded_qt_container)
-                self.embedded_qt_container.deleteLater()
-                self.embedded_qt_container = None
-
-            self.foreign_qwindow = QWindow.fromWinId(win_id)
-            if not self.foreign_qwindow:
-                raise ValueError(f"Cannot resolve QWindow for WinID: {hex(win_id)}")
-
-            self.embedded_qt_container = QWidget.createWindowContainer(self.foreign_qwindow, self.content_area)
-            self.embedded_qt_container.setFocusPolicy(Qt.StrongFocus)
-            
-            self.content_layout.addWidget(self.embedded_qt_container)
-            self.embedded_qt_container.show()
-            self.foreign_qwindow.setGeometry(0, 0, self.content_area.width(), self.content_area.height())
-            return True
-
+            g = self._x(self.host_xid()).get_geometry()
+            if g.width > 0 and g.height > 0:
+                return int(g.width), int(g.height)
         except Exception as err:
-            print(f"[ERROR] Failed to attach foreign window: {err}")
+            print(f"[WARN] host get_geometry: {err}")
+        dpr = self.devicePixelRatioF()
+        return (
+            max(1, int(round(self.width() * dpr))),
+            max(1, int(round(self.height() * dpr))),
+        )
+
+    def _frame_extents(self, win_id: int) -> tuple[int, int, int, int]:
+        try:
+            atom = self.x_display.intern_atom("_NET_FRAME_EXTENTS")
+            prop = self._x(win_id).get_full_property(atom, X.AnyPropertyType)
+            if prop and prop.value and len(prop.value) >= 4:
+                extents = tuple(int(prop.value[i]) for i in range(4))
+                print(f"[FRAME] LRTB={extents}")
+                return extents  # type: ignore[return-value]
+        except Exception as err:
+            print(f"[FRAME] {err}")
+        return 0, 0, 0, 0
+
+    def resolve_client_window(self, win_id: int) -> int:
+        """Prefer largest mapped child when win_id is a WM/Wine frame."""
+        self._frame_extents(win_id)
+        wine = self._x(win_id)
+        try:
+            children = list(wine.query_tree().children)
+        except Exception:
+            return win_id
+
+        parent_geom = wine.get_geometry()
+        parent_area = max(1, parent_geom.width * parent_geom.height)
+        best_id, best_area = win_id, 0
+
+        for child in children:
+            try:
+                cg = child.get_geometry()
+                if child.get_attributes().map_state != X.IsViewable:
+                    continue
+                area = cg.width * cg.height
+                if area > best_area and area >= parent_area * 0.5:
+                    best_area = area
+                    best_id = child.id
+                    print(f"[CLIENT] child={hex(child.id)} {cg.width}x{cg.height} @({cg.x},{cg.y})")
+            except Exception:
+                continue
+
+        if best_id != win_id:
+            print(f"[CLIENT] use {hex(best_id)} instead of frame {hex(win_id)}")
+        return best_id
+
+    def _apply_hints(self, win_obj, w: int, h: int):
+        win_obj.set_wm_normal_hints(hints={
+            "flags": (
+                Xutil.PPosition | Xutil.PSize | Xutil.PMinSize
+                | Xutil.PMaxSize | Xutil.PWinGravity
+            ),
+            "x": 0, "y": 0,
+            "width": w, "height": h,
+            "min_width": w, "min_height": h,
+            "max_width": w, "max_height": h,
+            "win_gravity": X.NorthWestGravity,
+        })
+
+    def configure_foreign(self, w: int, h: int):
+        if not self.foreign_win_id or not self.x_display:
+            return
+        wine = self._x(self.foreign_win_id)
+        wine.configure(x=0, y=0, width=w, height=h, border_width=0)
+        self._apply_hints(wine, w, h)
+
+    def sync_foreign_geometry(self):
+        if not self.foreign_win_id or not self.x_display:
+            return
+        try:
+            host_xid = self.host_xid()
+            wine = self._x(self.foreign_win_id)
+            if wine.query_tree().parent.id != host_xid:
+                wine.reparent(self._x(host_xid), 0, 0)
+            w, h = self.host_pixel_size()
+            self.configure_foreign(w, h)
+            self.x_display.flush()
+        except Exception as err:
+            print(f"[WARN] sync: {err}")
+
+    def log_geom(self, tag: str):
+        if not self.foreign_win_id or not self.x_display:
+            return
+        try:
+            wine = self._x(self.foreign_win_id)
+            g = wine.get_geometry()
+            parent = wine.query_tree().parent.id
+            host = self.host_xid()
+            hg = self._x(host).get_geometry()
+            ok = "OK" if parent == host and g.x == 0 and g.y == 0 else "BAD"
+            print(
+                f"[GEOM {tag}] {ok} wine={hex(self.foreign_win_id)} "
+                f"xy=({g.x},{g.y}) {g.width}x{g.height} "
+                f"parent={hex(parent)} host={hex(host)} {hg.width}x{hg.height}"
+            )
+        except Exception as err:
+            print(f"[GEOM {tag}] {err}")
+
+    def embed(self, win_id: int, lock_aspect: bool = True) -> bool:
+        """Reparent Wine into this host and resize 1:1 to host pixels."""
+        try:
+            if not self.x_display:
+                raise RuntimeError("XDisplay unavailable")
+
+            self._geom_lock.stop()
+            QApplication.processEvents()
+
+            host_xid = self.host_xid()
+            client_id = self.resolve_client_window(win_id)
+            self.foreign_win_id = client_id
+
+            # Capture native aspect before we force-fit (for optional letterbox UI later)
+            try:
+                ng = self._x(client_id).get_geometry()
+                if lock_aspect and ng.width > 0 and ng.height > 0:
+                    self.aspect = (ng.width, ng.height)
+                else:
+                    self.aspect = None
+            except Exception:
+                self.aspect = None
+
+            pw, ph = self.host_pixel_size()
+            print(f"[EMBED] host={hex(host_xid)} {pw}x{ph} client={hex(client_id)} aspect={self.aspect}")
+
+            wine = self._x(client_id)
+            wine.change_attributes(override_redirect=True)
+            wine.reparent(self._x(host_xid), 0, 0)
+            self.configure_foreign(pw, ph)
+            wine.map()
+            wine.change_attributes(override_redirect=True)
+            self.x_display.sync()
+
+            self.log_geom("after-reparent")
+            self.sync_foreign_geometry()
+            self.log_geom("after-sync")
+
+            self._geom_lock.start()
+            QTimer.singleShot(0, self.sync_foreign_geometry)
+            QTimer.singleShot(100, self.sync_foreign_geometry)
+            QTimer.singleShot(300, lambda: self.log_geom("t+300ms"))
+            return True
+        except Exception as err:
+            print(f"[ERROR] embed failed: {err}")
             return False
-
-    def mousePressEvent(self, event: QMouseEvent):
-        if event.button() == Qt.LeftButton:
-            self.is_dragging = True
-            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
-            event.accept()
-
-    def mouseMoveEvent(self, event: QMouseEvent):
-        if self.is_dragging and event.buttons() == Qt.LeftButton:
-            new_pos = event.globalPosition().toPoint() - self.drag_position
-            if self.parent():
-                parent_rect = self.parent().rect()
-                new_x = max(0, min(new_pos.x(), parent_rect.width() - self.width()))
-                new_y = max(0, min(new_pos.y(), parent_rect.height() - self.height()))
-                self.move(new_x, new_y)
-            else:
-                self.move(new_pos)
-            event.accept()
-
-    def mouseReleaseEvent(self, event: QMouseEvent):
-        self.is_dragging = False
 
     def resizeEvent(self, event: QResizeEvent):
         super().resizeEvent(event)
-        if self.foreign_qwindow and self.embedded_qt_container:
-            self.foreign_qwindow.setGeometry(0, 0, self.content_area.width(), self.content_area.height())
+        # Keep Wine pixel-perfect with host — 1:1 click mapping, no float panel.
+        self.sync_foreign_geometry()
 
 
-class WineAutoClickerPoC(QWidget):
+class WineEmbedPoC(QWidget):
+    """
+    Strategy: no floating window.
+    Toolbar on top, EmbedHost fills the rest; Wine is reparented into EmbedHost
+    and resized to the host on every layout change.
+    """
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PoC: Strategy 2 - Main Resize First then Embed (Niri / XWayland)")
+        self.setWindowTitle("PoC: Direct Embed (no float) — resize 1:1 into main viewport")
         self.resize(1200, 850)
 
-        # Connect to active XWayland display session dynamically
         self.x_display = self._init_x11_display()
         self.win_id = None
 
-        self.init_ui()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
-        # Create Floating Overlay Panel
-        self.floating_panel = FloatingContainer(self)
-        self.floating_panel.setGeometry(50, 200, 800, 636) # 600 content + 30 header + 6 padding
-        self.floating_panel.show()
+        # --- Controls ---
+        top = QGroupBox("1. Resize on main screen → embed into viewport (no floating panel)")
+        top_l = QHBoxLayout(top)
 
-    def _init_x11_display(self):
-        """Connects to active XWayland display session managed by Niri."""
-        display_name = os.environ.get("DISPLAY")
-        if not display_name:
-            print("[ERROR] $DISPLAY variable is not set by Niri compositor!")
-            return None
-
-        try:
-            x_disp = display.Display(display_name)
-            print(f"[INFO] Successfully connected to active XWayland Display: {display_name}")
-            return x_disp
-        except Exception as err:
-            print(f"[ERROR] Failed to connect to XDisplay '{display_name}': {err}")
-            return None
-
-    def init_ui(self):
-        main_layout = QVBoxLayout(self)
-
-        # --- Top Control Bar: Window ID & Target Dimension Input ---
-        top_box = QGroupBox("1. Strategy: Resize Wine App at Main Screen -> Embed")
-        top_layout = QHBoxLayout(top_box)
-        
-        top_layout.addWidget(QLabel("Window ID:"))
+        top_l.addWidget(QLabel("Window ID:"))
         self.win_id_input = QLineEdit()
         self.win_id_input.setPlaceholderText("e.g. 0x3c00009")
-        top_layout.addWidget(self.win_id_input)
+        top_l.addWidget(self.win_id_input)
 
-        top_layout.addWidget(QLabel("Target Width:"))
+        top_l.addWidget(QLabel("Pre-resize W×H (0 = skip):"))
         self.width_input = QLineEdit("800")
-        self.width_input.setFixedWidth(60)
-        top_layout.addWidget(self.width_input)
-
-        top_layout.addWidget(QLabel("Target Height:"))
+        self.width_input.setFixedWidth(56)
+        top_l.addWidget(self.width_input)
         self.height_input = QLineEdit("600")
-        self.height_input.setFixedWidth(60)
-        top_layout.addWidget(self.height_input)
+        self.height_input.setFixedWidth(56)
+        top_l.addWidget(self.height_input)
 
-        self.process_btn = QPushButton("Resize on Main & Embed Window")
+        self.lock_aspect_chk = QCheckBox("Remember aspect")
+        self.lock_aspect_chk.setChecked(True)
+        self.lock_aspect_chk.setToolTip("Store native aspect after embed (informational); Wine still fills host 1:1.")
+        top_l.addWidget(self.lock_aspect_chk)
+
+        self.fit_btn = QPushButton("Fit window to Wine aspect")
+        self.fit_btn.setToolTip("Resize this Qt window so the viewport matches stored Wine aspect.")
+        self.fit_btn.clicked.connect(self.fit_window_to_aspect)
+        top_l.addWidget(self.fit_btn)
+
+        self.process_btn = QPushButton("Embed into main viewport")
         self.process_btn.setStyleSheet("background-color: #007acc; color: white; font-weight: bold;")
-        self.process_btn.clicked.connect(self.resize_main_and_embed)
-        top_layout.addWidget(self.process_btn)
+        self.process_btn.clicked.connect(self.resize_and_embed)
+        top_l.addWidget(self.process_btn)
+        root.addWidget(top)
 
-        main_layout.addWidget(top_box)
-
-        # --- Background Auto-Click Controls (Direct 1:1 Mapping) ---
-        click_box = QGroupBox("2. Direct 1:1 Background Auto-Click (No Coordinate Scaling Required)")
-        click_layout = QHBoxLayout(click_box)
-
-        click_layout.addWidget(QLabel("Target Coordinates (X, Y):"))
+        click = QGroupBox("2. Direct 1:1 click (coords relative to Wine / viewport)")
+        click_l = QHBoxLayout(click)
+        click_l.addWidget(QLabel("X, Y:"))
         self.click_x_input = QLineEdit("50")
-        self.click_x_input.setFixedWidth(50)
-        click_layout.addWidget(self.click_x_input)
-
+        self.click_x_input.setFixedWidth(48)
+        click_l.addWidget(self.click_x_input)
         self.click_y_input = QLineEdit("50")
-        self.click_y_input.setFixedWidth(50)
-        click_layout.addWidget(self.click_y_input)
-
-        self.use_xtest_chk = QCheckBox("Use XTest Fake Input")
+        self.click_y_input.setFixedWidth(48)
+        click_l.addWidget(self.click_y_input)
+        self.use_xtest_chk = QCheckBox("XTest")
         self.use_xtest_chk.setChecked(True)
-        click_layout.addWidget(self.use_xtest_chk)
-
-        self.click_btn = QPushButton("Send Direct Click")
+        click_l.addWidget(self.use_xtest_chk)
+        self.click_btn = QPushButton("Send Click")
         self.click_btn.setStyleSheet("background-color: #2e7d32; color: white; font-weight: bold;")
         self.click_btn.clicked.connect(self.send_direct_click)
-        click_layout.addWidget(self.click_btn)
+        click_l.addWidget(self.click_btn)
+        click_l.addStretch()
+        root.addWidget(click)
 
-        main_layout.addWidget(click_box)
+        # --- Main viewport (takes all remaining space) ---
+        self.embed_host = EmbedHost(x_display=self.x_display)
+        root.addWidget(self.embed_host, stretch=1)
 
-        main_layout.addStretch()
+        self.status = QLabel("Viewport ready — paste Wine window id and Embed.")
+        self.status.setStyleSheet("color: #aaaaaa;")
+        root.addWidget(self.status)
 
-    def resize_main_and_embed(self):
-        """
-        New Strategy Pipeline:
-        1. Resize target Wine window on Main Screen (Native X11 Level)
-        2. Wait for Wine/X11 to flush & layout
-        3. Adjust Floating Container size to match
-        4. Reparent/Attach Window into Container
-        """
+    def _init_x11_display(self):
+        name = os.environ.get("DISPLAY")
+        if not name:
+            print("[ERROR] $DISPLAY not set")
+            return None
+        try:
+            d = display.Display(name)
+            print(f"[INFO] XWayland Display: {name}")
+            return d
+        except Exception as err:
+            print(f"[ERROR] XDisplay: {err}")
+            return None
+
+    def resize_and_embed(self):
         win_id_str = self.win_id_input.text().strip()
         if not win_id_str:
-            QMessageBox.warning(self, "Error", "Please input a valid Window ID!")
+            QMessageBox.warning(self, "Error", "Please input a Window ID")
+            return
+        if not self.x_display:
+            QMessageBox.critical(self, "Error", "XDisplay unavailable")
             return
 
         try:
-            target_w = int(self.width_input.text())
-            target_h = int(self.height_input.text())
             self.win_id = int(win_id_str, 16) if win_id_str.startswith("0x") else int(win_id_str)
+            pre_w = int(self.width_input.text() or "0")
+            pre_h = int(self.height_input.text() or "0")
 
-            if not self.x_display:
-                QMessageBox.critical(self, "Error", "XDisplay is unavailable!")
-                return
+            print("\n=== DIRECT EMBED PIPELINE ===")
+            wine = self.x_display.create_resource_object("window", self.win_id)
 
-            print(f"\n=== STRATEGY 2 PIPELINE START ===")
-            print(f"[STEP 1] Resizing Native X11 Window {hex(self.win_id)} to ({target_w}x{target_h}) on Main Screen...")
-            
-            # Send native X11 configure request to resize window BEFORE reparenting
-            win_obj = self.x_display.create_resource_object('window', self.win_id)
-            win_obj.configure(width=target_w, height=target_h)
-            self.x_display.flush()
-
-            # Process Qt events to let X11 & Wine handle geometry layout changes
-            QApplication.processEvents()
-            time.sleep(0.15) # Brief pause to allow Wine GDI/DirectX to re-render layout
-
-            # Step 2: Adjust Floating Container to hold exact content area + header/padding
-            # Header = 30px, Top/Bottom Margins = 6 + 6 = 12px, Borders = 4px -> Height Offset = 42px
-            container_w = target_w + 12
-            container_h = target_h + 42
-            self.floating_panel.resize(container_w, container_h)
-            print(f"[STEP 2] Adjusted Floating Panel Outer Container to ({container_w}x{container_h})")
-
-            # Step 3: Embed Foreign Window into Container
-            print(f"[STEP 3] Reparenting/Attaching Foreign Window into Qt Container...")
-            success = self.floating_panel.attach_foreign_window(self.win_id)
-
-            if success:
-                QMessageBox.information(
-                    self, "Success", 
-                    f"Successfully resized Native Window to {target_w}x{target_h} on Main Screen and embedded into Panel!"
-                )
+            # Optional: resize on main screen first (lets Wine GDI/D3D settle)
+            if pre_w > 0 and pre_h > 0:
+                print(f"[STEP 1] Pre-resize {hex(self.win_id)} -> {pre_w}x{pre_h}")
+                wine.configure(width=pre_w, height=pre_h)
+                self.x_display.flush()
+                QApplication.processEvents()
+                time.sleep(0.15)
             else:
-                QMessageBox.critical(self, "Error", f"Failed to attach window {hex(self.win_id)}.")
+                print("[STEP 1] Skip pre-resize")
 
+            # Ensure viewport has a real size, then embed + force Wine = host size
+            QApplication.processEvents()
+            hw, hh = self.embed_host.width(), self.embed_host.height()
+            print(f"[STEP 2] Viewport Qt size {hw}x{hh}")
+
+            print("[STEP 3] Reparent into main EmbedHost")
+            ok = self.embed_host.embed(self.win_id, lock_aspect=self.lock_aspect_chk.isChecked())
+            if ok and self.embed_host.foreign_win_id:
+                self.win_id = self.embed_host.foreign_win_id
+                pw, ph = self.embed_host.host_pixel_size()
+                self.status.setText(
+                    f"Embedded {hex(self.win_id)} @ {pw}x{ph} (1:1 with viewport). "
+                    f"Resize the window — Wine follows."
+                )
+                QMessageBox.information(self, "OK", f"Embedded into main viewport at {pw}x{ph}")
+            else:
+                QMessageBox.critical(self, "Error", "Embed failed — see terminal logs")
         except Exception as err:
-            QMessageBox.critical(self, "Error", f"Execution failed: {str(err)}")
+            QMessageBox.critical(self, "Error", str(err))
+
+    def fit_window_to_aspect(self):
+        """Resize Qt window so embed_host matches remembered Wine aspect."""
+        aspect = self.embed_host.aspect
+        if not aspect:
+            QMessageBox.information(self, "Aspect", "No aspect stored yet — embed first.")
+            return
+        aw, ah = aspect
+        host = self.embed_host
+        # Keep current host width, compute height from aspect (or vice versa if too tall)
+        target_h = max(1, int(round(host.width() * ah / aw)))
+        delta_h = target_h - host.height()
+        self.resize(self.width(), self.height() + delta_h)
+        QApplication.processEvents()
+        self.embed_host.sync_foreign_geometry()
+        print(f"[FIT] aspect {aw}:{ah} -> host {host.width()}x{host.height()}")
+        self.status.setText(f"Window fitted to aspect {aw}:{ah}")
 
     def send_direct_click(self):
-        """Dispatches mouse click with direct 1:1 coordinate mapping based on live container root location."""
         if not self.win_id or not self.x_display:
-            QMessageBox.warning(self, "Error", "Window not embedded or XDisplay unavailable!")
+            QMessageBox.warning(self, "Error", "Not embedded")
             return
-
         try:
-            target_x = int(self.click_x_input.text())
-            target_y = int(self.click_y_input.text())
+            tx = int(self.click_x_input.text())
+            ty = int(self.click_y_input.text())
+            wine = self.x_display.create_resource_object("window", self.win_id)
+            root = self.x_display.screen().root
+            tr = root.translate_coords(wine, tx, ty)
+            ax, ay = tr.x, tr.y
+            origin = self.embed_host.mapToGlobal(QPoint(0, 0))
+            print(f"[CLICK] local({tx},{ty}) root({ax},{ay}) qt_origin({origin.x()},{origin.y()})")
 
-            # Fetch the precise root position of embedded_qt_container (Excludes Header 30px & Margins)
-            content_win_id = int(self.floating_panel.embedded_qt_container.winId())
-            qt_container_x11 = self.x_display.create_resource_object('window', content_win_id)
-            root_win = self.x_display.screen().root
-
-            # Query dynamic root offset (Handles panel dragging anywhere on screen)
-            translated = qt_container_x11.translate_coordinates(root_win, 0, 0)
-            abs_root_x = translated.x + target_x
-            abs_root_y = translated.y + target_y
-
-            print(f"[CLICK DEBUG] Local Target : ({target_x}, {target_y})")
-            print(f"[CLICK DEBUG] Root Container: ({translated.x}, {translated.y})")
-            print(f"[CLICK DEBUG] Final Root Target: ({abs_root_x}, {abs_root_y})")
-
-            # Dispatch Event
             if self.use_xtest_chk.isChecked():
-                xtest.fake_input(self.x_display, X.MotionNotify, x=abs_root_x, y=abs_root_y)
+                xtest.fake_input(self.x_display, X.MotionNotify, x=ax, y=ay)
                 xtest.fake_input(self.x_display, X.ButtonPress, detail=1)
                 xtest.fake_input(self.x_display, X.ButtonRelease, detail=1)
                 self.x_display.flush()
-                print(f"[XTEST SUCCESS] Injected 1:1 hardware click at Root({abs_root_x}, {abs_root_y})")
             else:
-                window_obj = self.x_display.create_resource_object('window', self.win_id)
-                press_event = display.event.ButtonPress(
-                    detail=1, time=X.CurrentTime, root=root_win, window=window_obj, child=X.NONE,
-                    root_x=abs_root_x, root_y=abs_root_y, event_x=target_x, event_y=target_y,
-                    state=0, same_screen=1
+                wine.send_event(
+                    display.event.ButtonPress(
+                        detail=1, time=X.CurrentTime, root=root, window=wine, child=X.NONE,
+                        root_x=ax, root_y=ay, event_x=tx, event_y=ty, state=0, same_screen=1
+                    ),
+                    event_mask=X.ButtonPressMask,
                 )
-                release_event = display.event.ButtonRelease(
-                    detail=1, time=X.CurrentTime, root=root_win, window=window_obj, child=X.NONE,
-                    root_x=abs_root_x, root_y=abs_root_y, event_x=target_x, event_y=target_y,
-                    state=X.Button1Mask, same_screen=1
+                wine.send_event(
+                    display.event.ButtonRelease(
+                        detail=1, time=X.CurrentTime, root=root, window=wine, child=X.NONE,
+                        root_x=ax, root_y=ay, event_x=tx, event_y=ty, state=X.Button1Mask, same_screen=1
+                    ),
+                    event_mask=X.ButtonReleaseMask,
                 )
-                window_obj.send_event(press_event, event_mask=X.ButtonPressMask)
-                window_obj.send_event(release_event, event_mask=X.ButtonReleaseMask)
                 self.x_display.flush()
-                print(f"[XSendEvent SUCCESS] Sent 1:1 synthetic click at Local({target_x}, {target_y})")
-
         except Exception as err:
-            QMessageBox.critical(self, "Error", f"Failed to dispatch click: {str(err)}")
+            QMessageBox.critical(self, "Error", str(err))
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    win = WineAutoClickerPoC()
+    win = WineEmbedPoC()
     win.show()
     sys.exit(app.exec())
