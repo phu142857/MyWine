@@ -55,3 +55,14 @@ class X11WindowManager:
         )
 
         self.display.flush()
+
+    def set_focus(self, win_id):
+        self.window(win_id).set_input_focus(X.RevertToParent, X.CurrentTime)
+        self.Display.flush()
+
+    def click(self, root_x, root_y):
+        xtest.fake_input(self.display, X.MotionNotify, x = root_x, y = root_y)   
+        xtest.fake_input(self.display, X.ButtonPress, detail = 1)
+        xtest.fake_input(self.display, X.ButtonRelease, detail = 1)
+        
+        self.display.flush()
